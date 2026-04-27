@@ -32,10 +32,16 @@ class Settings(BaseSettings):
     # raw financial records) unless this is explicitly enabled by the operator.
     spond_mcp_allow_raw_payloads: bool = Field(default=False)
 
-    # Experimental upstream payloads (e.g. unverified attendance "unanswered"
-    # payload). Off by default so the server never sends a payload it has not
-    # verified against the upstream library or live API.
-    spond_mcp_allow_experimental_attendance_payloads: bool = Field(default=False)
+    # Contact detail policy: members' email and phone numbers are sensitive
+    # PII. They are omitted from compact summaries by default. The agent must
+    # explicitly request `include_contact=true`, AND this operator opt-in
+    # must be set, to receive them.
+    spond_mcp_allow_contact_details: bool = Field(default=False)
+
+    # File-export policy: writing the XLSX attendance report to a temp file
+    # is local-side-effecting (it can hold PII on disk). Off by default so the
+    # default deployment never persists Spond data outside memory.
+    spond_mcp_allow_file_exports: bool = Field(default=False)
 
     spond_mcp_max_events: int = Field(default=100, ge=1, le=1000)
     spond_mcp_timezone: str = Field(default="UTC")
@@ -67,8 +73,11 @@ class Settings(BaseSettings):
     def raw_payloads_allowed(self) -> bool:
         return self.spond_mcp_allow_raw_payloads
 
-    def experimental_attendance_allowed(self) -> bool:
-        return self.spond_mcp_allow_experimental_attendance_payloads
+    def contact_details_allowed(self) -> bool:
+        return self.spond_mcp_allow_contact_details
+
+    def file_exports_allowed(self) -> bool:
+        return self.spond_mcp_allow_file_exports
 
 
 @lru_cache(maxsize=1)

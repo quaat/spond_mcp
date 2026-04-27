@@ -23,7 +23,8 @@ async def test_get_profile_returns_summary(manager):
     mcp, _ = build_server(manager.settings, manager=manager)
     result = await _call(mcp, "spond_get_profile", {})
     assert result["full_name"] == "Test User"
-    assert result["email"] == "test@example.com"
+    # email is a contact detail and is gated; not present by default.
+    assert "email" not in result
     assert "raw" not in result
 
 
@@ -148,7 +149,9 @@ async def test_attendance_report_metadata_does_not_leak_bytes(manager):
 @pytest.mark.asyncio
 async def test_attendance_report_tempfile_writes_file(manager, tmp_path, monkeypatch):
     monkeypatch.setenv("TMPDIR", str(tmp_path))
-    mcp, _ = build_server(manager.settings, manager=manager)
+    s = manager.settings.model_copy(update={"spond_mcp_allow_file_exports": True})
+    manager.settings = s
+    mcp, _ = build_server(s, manager=manager)
     result = await _call(
         mcp,
         "spond_get_event_attendance_report",
@@ -304,42 +307,23 @@ async def test_change_response_translates_enum(manager):
 
 
 @pytest.mark.asyncio
-async def test_change_response_unanswered_blocked_by_default(manager):
-    """The 'unanswered' value must not produce an unverified upstream payload."""
+async def test_change_response_unanswered_rejected_by_schema(manager):
+    """The 'unanswered' value must not be sent to the upstream API."""
 
     s = manager.settings.model_copy(
         update={"spond_mcp_read_only": False, "spond_mcp_allow_attendance_changes": True}
     )
     manager.settings = s
     mcp, _ = build_server(s, manager=manager)
-    result = await _call(
-        mcp,
-        "spond_change_event_response",
-        {"event_id": "e1", "user_id": "m1", "response": "unanswered", "confirm": True},
-    )
-    assert result["error"] is True
-    assert result["code"] == "spond_validation_error"
+    # The schema only accepts accepted/declined; calling with "unanswered"
+    # raises a Pydantic validation error before reaching upstream.
+    with pytest.raises(Exception):  # noqa: B017 - the type comes from MCP
+        await _call(
+            mcp,
+            "spond_change_event_response",
+            {"event_id": "e1", "user_id": "m1", "response": "unanswered", "confirm": True},
+        )
     assert manager.fake.change_response_payloads == []
-
-
-@pytest.mark.asyncio
-async def test_change_response_unanswered_allowed_with_experimental_flag(manager):
-    s = manager.settings.model_copy(
-        update={
-            "spond_mcp_read_only": False,
-            "spond_mcp_allow_attendance_changes": True,
-            "spond_mcp_allow_experimental_attendance_payloads": True,
-        }
-    )
-    manager.settings = s
-    mcp, _ = build_server(s, manager=manager)
-    result = await _call(
-        mcp,
-        "spond_change_event_response",
-        {"event_id": "e1", "user_id": "m1", "response": "unanswered", "confirm": True},
-    )
-    assert "error" not in result or result.get("error") is None or result.get("error") is False
-    assert manager.fake.change_response_payloads[-1] == {"accepted": "unanswered"}
 
 
 # ---------------------------------------------------------------------------

@@ -19,19 +19,13 @@ from pydantic import BaseModel, ConfigDict, Field
 ResponseLiteral = Literal["accepted", "declined"]
 """Allowed values for the `spond_change_event_response` tool.
 
-Only "accepted" and "declined" are accepted by default because those are the
-only payload shapes that have been verified against the upstream library
-(`{"accepted": "true"}` / `{"accepted": "false"}`). The "unanswered" payload is
-not documented upstream; clients can opt in to it via
-`SPOND_MCP_ALLOW_EXPERIMENTAL_ATTENDANCE_PAYLOADS=true`.
-
-Note: "unanswered" is still surfaced in *read-side* counts/IDs because it is
-a documented attribute of the upstream `responses` object.
+Only "accepted" and "declined" are accepted because those are the only
+payload shapes that have been verified against the upstream library
+(`{"accepted": "true"}` / `{"accepted": "false"}`). An "unanswered" payload
+is not documented upstream and is not exposed by this server; surface
+unanswered counts/IDs through the read tools (`spond_get_event`,
+`AttendanceSummary`) instead.
 """
-
-ExperimentalResponseLiteral = Literal["accepted", "declined", "unanswered"]
-"""Same as :data:`ResponseLiteral` but includes the experimental "unanswered"
-payload. Only used when the operator has opted in."""
 
 JSONDict = dict[str, Any]
 
@@ -251,27 +245,40 @@ def _full_name(d: JSONDict) -> str | None:
     return first or last or d.get("name")
 
 
-def map_profile(profile: JSONDict, *, include_raw: bool = False) -> ProfileSummary:
+def map_profile(
+    profile: JSONDict,
+    *,
+    include_raw: bool = False,
+    include_contact: bool = False,
+) -> ProfileSummary:
     profile = profile or {}
     contact = profile.get("contactInfo") or profile.get("contact") or {}
+    email = profile.get("email") or contact.get("email")
+    phone = profile.get("phoneNumber") or contact.get("phone")
     return ProfileSummary(
         profile_id=profile.get("id") or profile.get("profileId"),
         full_name=_full_name(profile),
-        email=profile.get("email") or contact.get("email"),
-        phone=profile.get("phoneNumber") or contact.get("phone"),
+        email=email if include_contact else None,
+        phone=phone if include_contact else None,
         locale=profile.get("language") or profile.get("locale"),
         raw=profile if include_raw else None,
     )
 
 
-def map_member(member: JSONDict, *, is_guardian: bool = False, include_raw: bool = False) -> MemberSummary:
+def map_member(
+    member: JSONDict,
+    *,
+    is_guardian: bool = False,
+    include_raw: bool = False,
+    include_contact: bool = False,
+) -> MemberSummary:
     member = member or {}
     profile = member.get("profile") or {}
     return MemberSummary(
         member_id=member.get("id"),
         profile_id=profile.get("id") if isinstance(profile, dict) else None,
         full_name=_full_name(member),
-        email=member.get("email"),
+        email=member.get("email") if include_contact else None,
         role=member.get("role") or member.get("roleTitle"),
         is_guardian=is_guardian,
         raw=member if include_raw else None,
@@ -283,13 +290,17 @@ def map_group(
     *,
     include_members: bool = False,
     include_raw: bool = False,
+    include_contact: bool = False,
 ) -> GroupSummary:
     group = group or {}
     members_raw = group.get("members") or []
     subgroups = group.get("subGroups") or group.get("subgroups") or []
     members: list[MemberSummary] | None = None
     if include_members:
-        members = [map_member(m, include_raw=include_raw) for m in members_raw]
+        members = [
+            map_member(m, include_raw=include_raw, include_contact=include_contact)
+            for m in members_raw
+        ]
     return GroupSummary(
         group_id=group.get("id", ""),
         name=group.get("name"),

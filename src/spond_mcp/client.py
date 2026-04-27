@@ -9,6 +9,7 @@ needs to handle raw aiohttp/library errors.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -132,20 +133,67 @@ class SpondClientManager:
             # Reset the client so a future call can retry with fresh state.
             await self.aclose()
             raise SpondAuthError("Spond authentication failed.") from exc
-        except KeyError as exc:
-            from .errors import SpondNotFoundError
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            raise self._normalize(op, exc) from exc
 
-            raise SpondNotFoundError(str(exc)) from exc
-        except NotImplementedError as exc:
-            raise SpondUnsupportedError(str(exc)) from exc
-        except ValueError as exc:
+    async def resolve_awaitable_result(self, op: str, result: Any) -> Any:
+        """Drain awaitable results returned by upstream calls.
+
+        Some upstream methods (e.g. ``Spond.send_message`` on the ``chat_id``
+        branch) return an *un-awaited* coroutine instead of awaiting it
+        themselves. Repeatedly await results until the value is no longer an
+        awaitable, applying the same exception sanitization as :meth:`call`
+        so the nested step cannot leak raw upstream error bodies, tokens,
+        cookies, or request payloads.
+        """
+
+        steps = 0
+        while inspect.isawaitable(result):
+            steps += 1
+            if steps > 4:
+                # Refuse to spin if upstream chains awaitables indefinitely.
+                # Returning a clean upstream error is better than hanging.
+                raise SpondUpstreamError(
+                    f"Spond call '{op}' returned an unbounded chain of awaitables.",
+                )
+            awaitable = result
+            try:
+                result = await awaitable
+            except SpondMcpError:
+                raise
+            except AuthenticationError as exc:
+                await self.aclose()
+                raise SpondAuthError("Spond authentication failed.") from exc
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                raise self._normalize(op, exc) from exc
+        return result
+
+    def _normalize(self, op: str, exc: Exception) -> SpondMcpError:
+        """Translate a non-auth upstream exception into a sanitised MCP error.
+
+        Centralised so :meth:`call` and :meth:`resolve_awaitable_result`
+        return the *same* envelope. Raw exception bodies (which may include
+        request payloads) never reach the caller verbatim.
+        """
+
+        from .errors import SpondNotFoundError
+
+        if isinstance(exc, KeyError):
+            return SpondNotFoundError(str(exc))
+        if isinstance(exc, NotImplementedError):
+            return SpondUnsupportedError(str(exc))
+        if isinstance(exc, ValueError):
             # Upstream raises ValueError on non-2xx responses, embedding
-            # body text. Strip it so we do not leak request artefacts.
+            # body text. Strip after the first ":" so we do not leak request
+            # artefacts (token=..., outgoing message text, etc.).
             msg = str(exc).split(":", 1)[0].strip() or "Spond request failed"
             logger.warning("spond.%s upstream error", op)
-            raise SpondUpstreamError(msg) from exc
-        except Exception as exc:
-            logger.warning("spond.%s unexpected error: %s", op, exc.__class__.__name__)
-            raise SpondUpstreamError(
-                f"Spond call '{op}' failed: {exc.__class__.__name__}"
-            ) from exc
+            return SpondUpstreamError(msg)
+        logger.warning("spond.%s unexpected error: %s", op, exc.__class__.__name__)
+        return SpondUpstreamError(
+            f"Spond call '{op}' failed: {exc.__class__.__name__}"
+        )

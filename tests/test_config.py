@@ -71,10 +71,3 @@ def test_raw_payloads_disabled_by_default(monkeypatch):
     s = Settings(_env_file=None)
     assert s.spond_mcp_allow_raw_payloads is False
     assert s.raw_payloads_allowed() is False
-
-
-def test_experimental_attendance_disabled_by_default(monkeypatch):
-    monkeypatch.delenv("SPOND_MCP_ALLOW_EXPERIMENTAL_ATTENDANCE_PAYLOADS", raising=False)
-    s = Settings(_env_file=None)
-    assert s.spond_mcp_allow_experimental_attendance_payloads is False
-    assert s.experimental_attendance_allowed() is False

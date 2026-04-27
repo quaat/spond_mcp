@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 from datetime import UTC, datetime, timedelta
@@ -30,7 +30,6 @@ from .schemas import (
     ChatSummary,
     EventDetail,
     EventSummary,
-    ExperimentalResponseLiteral,
     GroupSummary,
     JSONDict,
     MemberSummary,
@@ -91,6 +90,49 @@ def _check_raw_allowed(settings: Settings, requested: bool) -> None:
         )
 
 
+# Allow conservative filename-safe characters only. Spond event ids look like
+# UUID-style hex+dashes, so this is forgiving enough; anything outside is
+# replaced.
+_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9_-]")
+_MAX_FILENAME_STEM = 64
+
+
+def _safe_xlsx_filename(event_id: str) -> str:
+    """Build a deterministic XLSX filename that is safe to write to disk.
+
+    - strips path separators and any character outside ``[A-Za-z0-9_-]``
+    - strips leading dots so the filename cannot become hidden / traversal
+    - bounds the stem to 64 characters
+    - always returns a name ending in ``.xlsx``
+    - falls back to a stable name if the input has no safe characters
+    """
+
+    cleaned = _SAFE_FILENAME_RE.sub("_", event_id or "").lstrip(".")
+    cleaned = cleaned[:_MAX_FILENAME_STEM] or "event"
+    return f"spond-attendance-{cleaned}.xlsx"
+
+
+def _check_contact_allowed(settings: Settings, requested: bool) -> None:
+    """Reject ``include_contact=true`` unless the operator has opted in.
+
+    Member email and phone numbers are PII. They are stripped from default
+    summaries so an autonomous agent does not accidentally exfiltrate contact
+    details into a transcript or downstream tool call.
+    """
+
+    if requested and not settings.contact_details_allowed():
+        raise SpondPolicyError(
+            "Contact details are disabled by policy.",
+            details={
+                "hint": (
+                    "Set SPOND_MCP_ALLOW_CONTACT_DETAILS=true to permit "
+                    "include_contact responses. Names and IDs are returned "
+                    "without it."
+                ),
+            },
+        )
+
+
 def _wrap_tool(fn):
     """Decorator that translates SpondMcpError to a uniform JSON error."""
 
@@ -133,33 +175,49 @@ def build_server(
 
     @mcp.tool(
         name="spond_get_profile",
-        description="Get the authenticated Spond account profile.",
+        description=(
+            "Get the authenticated Spond account profile. Email and phone are "
+            "omitted unless include_contact=true and "
+            "SPOND_MCP_ALLOW_CONTACT_DETAILS=true."
+        ),
     )
     @_wrap_tool
     async def spond_get_profile(
+        include_contact: Annotated[
+            bool, Field(description="Include email and phone (PII) in the response")
+        ] = False,
         include_raw: Annotated[bool, Field(description="Include the raw upstream payload")] = False,
         refresh: Annotated[bool, Field(description="Bypass the in-memory cache")] = False,
     ) -> JSONResult:
         _check_raw_allowed(settings, include_raw)
+        _check_contact_allowed(settings, include_contact)
 
         async def _fetch() -> JSONDict:
             client = await manager.get_spond()
             return await manager.call("get_profile", client.get_profile)
 
         data = await manager.cache.get_or_set("profile", _fetch, refresh=refresh)
-        return map_profile(data, include_raw=include_raw).model_dump(exclude_none=True)
+        return map_profile(
+            data, include_raw=include_raw, include_contact=include_contact
+        ).model_dump(exclude_none=True)
 
     @mcp.tool(
         name="spond_list_groups",
-        description="List groups the authenticated user can access.",
+        description=(
+            "List groups the authenticated user can access. Member email and "
+            "phone are omitted unless include_contact=true and "
+            "SPOND_MCP_ALLOW_CONTACT_DETAILS=true."
+        ),
     )
     @_wrap_tool
     async def spond_list_groups(
         include_members: bool = False,
+        include_contact: bool = False,
         include_raw: bool = False,
         refresh: bool = False,
     ) -> JSONResult:
         _check_raw_allowed(settings, include_raw)
+        _check_contact_allowed(settings, include_contact)
 
         async def _fetch() -> list[JSONDict]:
             client = await manager.get_spond()
@@ -168,9 +226,12 @@ def build_server(
         groups = await manager.cache.get_or_set("groups", _fetch, refresh=refresh)
         return {
             "groups": [
-                map_group(g, include_members=include_members, include_raw=include_raw).model_dump(
-                    exclude_none=True
-                )
+                map_group(
+                    g,
+                    include_members=include_members,
+                    include_raw=include_raw,
+                    include_contact=include_contact,
+                ).model_dump(exclude_none=True)
                 for g in groups
             ],
             "count": len(groups),
@@ -184,12 +245,14 @@ def build_server(
     async def spond_get_group(
         group_id: str,
         include_members: bool = True,
+        include_contact: bool = False,
         include_raw: bool = False,
         refresh: bool = False,
     ) -> JSONResult:
         if not group_id:
             raise SpondValidationError("group_id is required")
         _check_raw_allowed(settings, include_raw)
+        _check_contact_allowed(settings, include_contact)
 
         async def _fetch() -> JSONDict:
             client = await manager.get_spond()
@@ -197,9 +260,12 @@ def build_server(
 
         cache_key = f"group:{group_id}"
         group = await manager.cache.get_or_set(cache_key, _fetch, refresh=refresh)
-        return map_group(group, include_members=include_members, include_raw=include_raw).model_dump(
-            exclude_none=True
-        )
+        return map_group(
+            group,
+            include_members=include_members,
+            include_raw=include_raw,
+            include_contact=include_contact,
+        ).model_dump(exclude_none=True)
 
     @mcp.tool(
         name="spond_find_person",
@@ -209,28 +275,39 @@ def build_server(
     async def spond_find_person(
         query: str,
         group_id: str | None = None,
+        include_contact: bool = False,
         include_raw: bool = False,
     ) -> JSONResult:
         if not query or not query.strip():
             raise SpondValidationError("query must not be empty")
         _check_raw_allowed(settings, include_raw)
+        _check_contact_allowed(settings, include_contact)
 
         client = await manager.get_spond()
         if group_id:
             group = await manager.call("get_group", lambda: client.get_group(group_id))
             for member in group.get("members") or []:
                 if _match_person(member, query):
-                    return _person_result(member, include_raw=include_raw)
+                    return _person_result(
+                        member, include_raw=include_raw, include_contact=include_contact
+                    )
                 for guardian in member.get("guardians") or []:
                     if _match_person(guardian, query):
-                        return _person_result(guardian, include_raw=include_raw, is_guardian=True)
+                        return _person_result(
+                            guardian,
+                            include_raw=include_raw,
+                            include_contact=include_contact,
+                            is_guardian=True,
+                        )
             raise SpondNotFoundError(f"No person matched '{query}' in group '{group_id}'")
 
         try:
             person = await manager.call("get_person", lambda: client.get_person(query))
         except SpondNotFoundError:
             raise SpondNotFoundError(f"No person matched '{query}'") from None
-        return _person_result(person, include_raw=include_raw)
+        return _person_result(
+            person, include_raw=include_raw, include_contact=include_contact
+        )
 
     @mcp.tool(
         name="spond_list_events",
@@ -375,8 +452,10 @@ def build_server(
     @mcp.tool(
         name="spond_get_event_attendance_report",
         description=(
-            "Export an event attendance report. Returns metadata only by default; "
-            "set mode='tempfile' to write the XLSX to a temp file and return its path."
+            "Export an event attendance report. Returns XLSX metadata only by "
+            "default. mode='tempfile' writes the XLSX to a sanitised temp file "
+            "and returns its path; that branch requires "
+            "SPOND_MCP_ALLOW_FILE_EXPORTS=true."
         ),
     )
     @_wrap_tool
@@ -387,6 +466,21 @@ def build_server(
         if not event_id:
             raise SpondValidationError("event_id is required")
 
+        # Gate the local-disk side effect *before* hitting the network so a
+        # disabled deployment never even fetches the bytes it cannot return.
+        if mode == "tempfile" and not settings.file_exports_allowed():
+            raise SpondPolicyError(
+                "Writing attendance reports to disk is disabled by policy.",
+                details={
+                    "hint": (
+                        "Set SPOND_MCP_ALLOW_FILE_EXPORTS=true to enable "
+                        "tempfile mode. Use mode='metadata' for a side-effect"
+                        "-free response."
+                    ),
+                },
+            )
+
+        filename = _safe_xlsx_filename(event_id)
         client = await manager.get_spond()
         data: bytes = await manager.call(
             "get_event_attendance_xlsx",
@@ -394,13 +488,14 @@ def build_server(
         )
         info: JSONResult = {
             "event_id": event_id,
-            "filename": f"spond-attendance-{event_id}.xlsx",
+            "filename": filename,
             "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             "byte_size": len(data),
         }
         if mode == "tempfile":
             tmp_dir = tempfile.mkdtemp(prefix="spond_mcp_")
-            path = os.path.join(tmp_dir, info["filename"])
+            # `filename` has been sanitised; join is safe relative to tmp_dir.
+            path = os.path.join(tmp_dir, filename)
             with open(path, "wb") as fh:
                 fh.write(data)
             info["path"] = path
@@ -409,21 +504,16 @@ def build_server(
     @mcp.tool(
         name="spond_change_event_response",
         description=(
-            "Change a user's response/attendance for an event. Accepts "
-            "response='accepted' or 'declined'. Requires "
-            "SPOND_MCP_ALLOW_ATTENDANCE_CHANGES=true and confirm=true. "
-            "The 'unanswered' value is experimental and only accepted when "
-            "SPOND_MCP_ALLOW_EXPERIMENTAL_ATTENDANCE_PAYLOADS=true."
+            "Change a user's response for an event. Accepts response='accepted' "
+            "or response='declined'. Requires SPOND_MCP_ALLOW_ATTENDANCE_CHANGES"
+            "=true and confirm=true."
         ),
     )
     @_wrap_tool
     async def spond_change_event_response(
         event_id: str,
         user_id: str,
-        # Typed as the experimental literal so the JSON schema lists every
-        # value the tool can accept; the runtime gate below rejects the
-        # experimental value unless the operator opted in.
-        response: ExperimentalResponseLiteral,
+        response: ResponseLiteral,
         confirm: bool = False,
     ) -> JSONResult:
         if not settings.attendance_changes_allowed():
@@ -438,11 +528,6 @@ def build_server(
             raise SpondPolicyError("Refusing to change attendance without confirm=true.")
         if not event_id or not user_id:
             raise SpondValidationError("event_id and user_id are required")
-        if response == "unanswered" and not settings.experimental_attendance_allowed():
-            raise SpondValidationError(
-                "response='unanswered' is experimental and disabled by policy. "
-                "Set SPOND_MCP_ALLOW_EXPERIMENTAL_ATTENDANCE_PAYLOADS=true to enable.",
-            )
 
         payload = _response_payload(response)
         client = await manager.get_spond()
@@ -534,11 +619,11 @@ def build_server(
             ),
         )
         # The upstream `send_message` has a known bug: in the chat_id path it
-        # returns the un-awaited coroutine produced by `_continue_chat`. Detect
-        # that and await it exactly once before reporting success, otherwise
-        # the message is never actually sent.
-        if inspect.isawaitable(result):
-            result = await result
+        # returns the un-awaited coroutine produced by `_continue_chat`. Drain
+        # it through the manager so any failure inside the continuation is
+        # sanitised by the same exception path as `call()` (no leaking of
+        # request bodies, tokens, or outgoing message text).
+        result = await manager.resolve_awaitable_result("send_message", result)
 
         # Treat any dict with an "error" key as a failure but never echo the
         # body back to the caller.
@@ -769,26 +854,28 @@ def _full_name(person: JSONDict) -> str | None:
     return first or last
 
 
-def _person_result(person: JSONDict, *, include_raw: bool = False, is_guardian: bool = False) -> JSONResult:
-    return map_member(person, is_guardian=is_guardian, include_raw=include_raw).model_dump(
-        exclude_none=True
-    )
+def _person_result(
+    person: JSONDict,
+    *,
+    include_raw: bool = False,
+    include_contact: bool = False,
+    is_guardian: bool = False,
+) -> JSONResult:
+    return map_member(
+        person,
+        is_guardian=is_guardian,
+        include_raw=include_raw,
+        include_contact=include_contact,
+    ).model_dump(exclude_none=True)
 
 
-def _response_payload(response: ExperimentalResponseLiteral) -> JSONDict:
-    """Translate the curated enum into the upstream payload.
-
-    Only "accepted" and "declined" map to documented upstream payloads.
-    "unanswered" is experimental and the caller is expected to have already
-    gated it on :meth:`Settings.experimental_attendance_allowed`.
-    """
+def _response_payload(response: ResponseLiteral) -> JSONDict:
+    """Translate the curated enum into the documented upstream payload."""
 
     if response == "accepted":
         return {"accepted": "true"}
     if response == "declined":
         return {"accepted": "false"}
-    if response == "unanswered":
-        return {"accepted": "unanswered"}
     raise SpondValidationError(f"Unsupported response value: {response!r}")
 
 

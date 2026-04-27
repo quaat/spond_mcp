@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from typing import Any
 
@@ -101,6 +102,80 @@ async def test_send_message_no_text_echo(manager):
     assert "secret-payload-zzz" not in json.dumps(result)
 
 
+@pytest.mark.asyncio
+async def test_send_message_nested_value_error_is_sanitised(manager):
+    """A ValueError raised inside the nested coroutine must be sanitised by
+    the same path as direct upstream errors: no token leak, no body leak."""
+
+    s = manager.settings.model_copy(
+        update={"spond_mcp_read_only": False, "spond_mcp_allow_messages": True}
+    )
+    manager.settings = s
+    fake = manager.fake
+
+    secret_body = "secret-outgoing-message-xyz"
+
+    async def _send(text, user=None, group_uid=None, chat_id=None):
+        async def _continuation():
+            raise ValueError(
+                f"Request failed with status 500: token=topsecret body={text}"
+            )
+
+        return _continuation()  # un-awaited coroutine
+
+    fake.send_message = _send
+    mcp, _ = build_server(s, manager=manager)
+    result = await _call(
+        mcp,
+        "spond_send_message",
+        {"text": secret_body, "chat_id": "c1", "confirm": True},
+    )
+    assert result["error"] is True
+    assert result["code"] == "spond_upstream_error"
+    serialised = json.dumps(result)
+    assert "topsecret" not in serialised
+    assert secret_body not in serialised
+    assert "token=" not in serialised
+
+
+@pytest.mark.asyncio
+async def test_send_message_nested_generic_exception_is_sanitised(manager):
+    """A generic exception inside the nested coroutine becomes a structured
+    upstream error and never carries the original repr to the caller."""
+
+    s = manager.settings.model_copy(
+        update={"spond_mcp_read_only": False, "spond_mcp_allow_messages": True}
+    )
+    manager.settings = s
+    fake = manager.fake
+
+    secret_body = "another-secret-message-ABCD"
+
+    class _LeakyError(Exception):
+        def __str__(self) -> str:
+            return f"leaky token=topsecret body={secret_body}"
+
+    async def _send(text, user=None, group_uid=None, chat_id=None):
+        async def _continuation():
+            raise _LeakyError()
+
+        return _continuation()
+
+    fake.send_message = _send
+    mcp, _ = build_server(s, manager=manager)
+    result = await _call(
+        mcp,
+        "spond_send_message",
+        {"text": secret_body, "chat_id": "c1", "confirm": True},
+    )
+    assert result["error"] is True
+    assert result["code"] == "spond_upstream_error"
+    serialised = json.dumps(result)
+    assert "topsecret" not in serialised
+    assert secret_body not in serialised
+    assert "token=" not in serialised
+
+
 # ---------------------------------------------------------------------------
 # 2. send_message: ambiguous routing
 # ---------------------------------------------------------------------------
@@ -179,18 +254,23 @@ async def test_raw_payloads_blocked_by_default(manager, tool, args):
 
 @pytest.mark.asyncio
 async def test_compact_summaries_have_no_raw_or_sensitive_fields(manager):
-    """Default responses must not embed raw upstream payloads."""
+    """Default responses must not embed raw upstream payloads or contact PII."""
 
     mcp, _ = build_server(manager.settings, manager=manager)
 
     profile = await _call(mcp, "spond_get_profile", {})
     assert "raw" not in profile
+    # Contact PII gated: profile must not expose email/phone by default.
+    assert "email" not in profile
+    assert "phone" not in profile
 
     groups = await _call(mcp, "spond_list_groups", {"include_members": True})
     for g in groups["groups"]:
         assert "raw" not in g
         for m in g.get("members", []):
             assert "raw" not in m
+            # Member email is contact PII; gated by default.
+            assert "email" not in m
 
     chats = await _call(mcp, "spond_list_messages", {"max_chats": 5})
     for c in chats["chats"]:
@@ -202,6 +282,162 @@ async def test_compact_summaries_have_no_raw_or_sensitive_fields(manager):
     txs = await _call(mcp2, "spond_list_club_transactions", {})
     for t in txs["transactions"]:
         assert "raw" not in t
+
+
+# ---------------------------------------------------------------------------
+# Contact-detail gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool, args",
+    [
+        ("spond_get_profile", {"include_contact": True}),
+        (
+            "spond_list_groups",
+            {"include_members": True, "include_contact": True},
+        ),
+        ("spond_get_group", {"group_id": "g1", "include_contact": True}),
+        (
+            "spond_find_person",
+            {"query": "alice@example.com", "include_contact": True},
+        ),
+    ],
+)
+async def test_contact_details_blocked_by_default(manager, tool, args):
+    mcp, _ = build_server(manager.settings, manager=manager)
+    result = await _call(mcp, tool, args)
+    assert result["error"] is True
+    assert result["code"] == "spond_policy_denied"
+
+
+@pytest.mark.asyncio
+async def test_contact_details_allowed_when_enabled(manager):
+    s = manager.settings.model_copy(update={"spond_mcp_allow_contact_details": True})
+    manager.settings = s
+    mcp, _ = build_server(s, manager=manager)
+
+    profile = await _call(mcp, "spond_get_profile", {"include_contact": True})
+    assert profile["email"] == "test@example.com"
+
+    group = await _call(
+        mcp,
+        "spond_get_group",
+        {"group_id": "g1", "include_members": True, "include_contact": True},
+    )
+    emails = [m.get("email") for m in group["members"]]
+    assert "alice@example.com" in emails
+
+
+@pytest.mark.asyncio
+async def test_guardian_email_gated_when_searching_in_group(manager):
+    """Guardians inside a group's members[*].guardians are PII too."""
+
+    mcp, _ = build_server(manager.settings, manager=manager)
+    # Default: no contact even though we matched the guardian by email.
+    result = await _call(
+        mcp,
+        "spond_find_person",
+        {"query": "bob@example.com", "group_id": "g1"},
+    )
+    assert result["is_guardian"] is True
+    assert "email" not in result
+
+
+# ---------------------------------------------------------------------------
+# XLSX attendance export hardening
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_attendance_report_metadata_returns_no_bytes(manager):
+    """Metadata mode never returns the binary payload inline."""
+
+    mcp, _ = build_server(manager.settings, manager=manager)
+    result = await _call(mcp, "spond_get_event_attendance_report", {"event_id": "e1"})
+    assert result["byte_size"] > 0
+    assert result["filename"].endswith(".xlsx")
+    for forbidden in ("bytes", "data", "content", "blob", "xlsx_bytes"):
+        assert forbidden not in result, f"metadata mode leaked {forbidden}"
+
+
+@pytest.mark.asyncio
+async def test_attendance_report_tempfile_blocked_by_default(manager, tmp_path, monkeypatch):
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    mcp, _ = build_server(manager.settings, manager=manager)
+    result = await _call(
+        mcp,
+        "spond_get_event_attendance_report",
+        {"event_id": "e1", "mode": "tempfile"},
+    )
+    assert result["error"] is True
+    assert result["code"] == "spond_policy_denied"
+    # And no file was written, since the policy gate runs before the network
+    # call.
+    assert not any(tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "evil_id",
+    [
+        "../etc/passwd",
+        "/abs/path",
+        "..\\windows",
+        "a/b/c",
+        "‮.xlsx",  # bidi override
+        "name with spaces",
+        "<script>",
+        "." * 200,
+        "",
+    ],
+)
+async def test_attendance_report_filename_is_sanitised(manager, evil_id):
+    s = manager.settings.model_copy(update={"spond_mcp_allow_file_exports": True})
+    manager.settings = s
+    mcp, _ = build_server(s, manager=manager)
+    result = await _call(
+        mcp,
+        "spond_get_event_attendance_report",
+        {"event_id": evil_id, "mode": "tempfile"},
+    )
+    # Some upstream calls may reject the id; that's an upstream/validation
+    # error rather than a path traversal — both outcomes are acceptable as
+    # long as nothing escapes the temp directory.
+    if result.get("error"):
+        return
+
+    filename = result["filename"]
+    path = result["path"]
+    # Filename safety properties:
+    assert "/" not in filename
+    assert "\\" not in filename
+    assert ".." not in filename
+    assert filename.endswith(".xlsx")
+    assert len(filename) <= 64 + len("spond-attendance-") + len(".xlsx")
+
+    # Path safety: the file lives inside the spond_mcp_-prefixed temp dir we
+    # created — not in some directory derived from the evil id.
+    real_path = os.path.realpath(path)
+    parent_basename = os.path.basename(os.path.dirname(real_path))
+    assert parent_basename.startswith("spond_mcp_")
+    # The basename equals the sanitised filename, not the evil id.
+    assert os.path.basename(real_path) == filename
+
+
+def test_safe_xlsx_filename_helper():
+    from spond_mcp.server import _safe_xlsx_filename
+
+    assert _safe_xlsx_filename("abc-123") == "spond-attendance-abc-123.xlsx"
+    assert _safe_xlsx_filename("../../etc/passwd") == "spond-attendance-______etc_passwd.xlsx"
+    assert _safe_xlsx_filename("") == "spond-attendance-event.xlsx"
+    long = "x" * 500
+    out = _safe_xlsx_filename(long)
+    assert out.startswith("spond-attendance-")
+    assert out.endswith(".xlsx")
+    # Stem capped: full filename ≤ prefix(17) + 64 + suffix(5).
+    assert len(out) <= 17 + 64 + 5
 
 
 @pytest.mark.asyncio
@@ -256,9 +492,12 @@ async def test_list_events_passes_aware_utc_datetimes_to_client(manager):
 
 
 @pytest.mark.asyncio
-async def test_change_response_schema_lists_only_safe_values_in_default_path(manager):
-    """The schema may list all three for ergonomics, but only accepted/declined
-    must work without the experimental flag."""
+async def test_change_response_schema_only_advertises_safe_values(manager):
+    """Default schema must expose only accepted/declined.
+
+    The unverified 'unanswered' payload is not exposed by the side-effecting
+    tool at all; it is surfaced only via read-side counts/IDs.
+    """
 
     s = manager.settings.model_copy(
         update={"spond_mcp_read_only": False, "spond_mcp_allow_attendance_changes": True}
@@ -268,9 +507,31 @@ async def test_change_response_schema_lists_only_safe_values_in_default_path(man
     tools = {t.name: t for t in await mcp.list_tools()}
     schema = tools["spond_change_event_response"].inputSchema
     response_schema = schema["properties"]["response"]
-    # Tool advertises the values that it can possibly accept; runtime gating
-    # blocks the experimental one.
-    assert set(response_schema.get("enum", [])) == {"accepted", "declined", "unanswered"}
+    assert set(response_schema.get("enum", [])) == {"accepted", "declined"}
+
+
+@pytest.mark.asyncio
+async def test_attendance_summary_still_includes_unanswered_counts(manager):
+    """Read-side attendance must still show unanswered counts/IDs."""
+
+    fake = manager.fake
+    fake.events_data = [
+        {
+            "id": "e1",
+            "heading": "Match",
+            "startTimestamp": "2026-05-01T10:00:00Z",
+            "endTimestamp": "2026-05-01T12:00:00Z",
+            "responses": {
+                "acceptedIds": ["m1"],
+                "declinedIds": [],
+                "unansweredIds": ["m2", "m3"],
+            },
+        }
+    ]
+    mcp, _ = build_server(manager.settings, manager=manager)
+    result = await _call(mcp, "spond_get_event", {"event_id": "e1"})
+    assert result["attendance"]["counts"]["unanswered"] == 2
+    assert result["attendance"]["unanswered_member_ids"] == ["m2", "m3"]
 
 
 @pytest.mark.asyncio

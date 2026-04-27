@@ -24,13 +24,19 @@ autonomous agents (Claude Desktop, Claude Code, MCP Inspector, etc.).
   (`include_raw=true`) require an explicit `SPOND_MCP_ALLOW_RAW_PAYLOADS=true`
   opt-in because they contain PII, full message bodies, and raw financial
   records.
-- Attendance changes accept only verified payloads (`accepted`, `declined`).
-  The unverified `unanswered` payload is opt-in via
-  `SPOND_MCP_ALLOW_EXPERIMENTAL_ATTENDANCE_PAYLOADS=true`.
+- Member email and phone numbers are gated behind `include_contact=true` *and*
+  `SPOND_MCP_ALLOW_CONTACT_DETAILS=true`. Default summaries return only
+  names/IDs.
+- Attendance changes accept only the documented payloads `accepted` and
+  `declined`. The unverified `unanswered` payload is not exposed by the
+  side-effecting tool; read tools still surface unanswered counts/IDs.
+- XLSX attendance exports default to a metadata-only response. Writing to a
+  temp file requires `SPOND_MCP_ALLOW_FILE_EXPORTS=true`, and the on-disk
+  filename is sanitised to be safe regardless of the upstream event id.
 - Lazy `aiohttp` session management with clean shutdown.
 - Short-TTL cache for low-risk reads, with `refresh: true` to bypass.
 - Pydantic-validated inputs and structured error envelopes.
-- 70 unit tests with fully fake Spond clients — no real credentials needed
+- 96 unit tests with fully fake Spond clients — no real credentials needed
   to run CI.
 
 ## Installation
@@ -63,7 +69,8 @@ cp .env.example .env
 | `SPOND_MCP_ALLOW_MESSAGES` | `false` | Allow `spond_send_message`. Has no effect unless `SPOND_MCP_READ_ONLY=false`. |
 | `SPOND_MCP_ALLOW_ATTENDANCE_CHANGES` | `false` | Allow `spond_change_event_response`. Has no effect unless `SPOND_MCP_READ_ONLY=false`. |
 | `SPOND_MCP_ALLOW_RAW_PAYLOADS` | `false` | Permit `include_raw=true` on read tools. Off by default to keep PII / financials / message bodies out of agent context. |
-| `SPOND_MCP_ALLOW_EXPERIMENTAL_ATTENDANCE_PAYLOADS` | `false` | Permit `response="unanswered"` on `spond_change_event_response`. The payload `{"accepted": "unanswered"}` is not documented upstream and may not behave as expected. |
+| `SPOND_MCP_ALLOW_CONTACT_DETAILS` | `false` | Permit `include_contact=true` on profile/group/find-person tools. Off by default to keep member email/phone out of summaries. |
+| `SPOND_MCP_ALLOW_FILE_EXPORTS` | `false` | Permit `mode="tempfile"` on `spond_get_event_attendance_report`. Off by default so the server never persists Spond data to disk. |
 | `SPOND_MCP_MAX_EVENTS` | `100` | Hard cap applied to `spond_list_events.max_events`. |
 | `SPOND_MCP_TIMEZONE` | `UTC` | Reserved for future schedule formatting. Internally everything stays in UTC. |
 | `SPOND_MCP_CACHE_TTL_SECONDS` | `60` | TTL for cached profile/groups/events/posts reads. Set to `0` to disable. |
@@ -152,7 +159,7 @@ in clients that surface MCP prompts.
 | `spond_get_event` | Single event with attendance summary. | No |
 | `spond_summarize_schedule` | Day-grouped schedule between two ISO datetimes. | No |
 | `spond_get_event_attendance_report` | XLSX export, returned as metadata or written to a temp file. | No |
-| `spond_change_event_response` | Set a member's response to *accepted* or *declined* (and *unanswered* under an experimental flag). | **Yes** |
+| `spond_change_event_response` | Set a member's response to *accepted* or *declined*. | **Yes** |
 | `spond_list_messages` | Recent chats with truncated previews. | No |
 | `spond_send_message` | Send a Spond chat message. | **Yes** |
 | `spond_list_posts` | Group wall posts (graceful error if the installed library lacks `get_posts`). | No |
@@ -164,6 +171,21 @@ payload, **but `include_raw` is rejected by default**: returning the raw
 payload requires `SPOND_MCP_ALLOW_RAW_PAYLOADS=true`. Without that opt-in,
 all reads return compact summaries only — never raw PII, full message
 bodies, or raw financial records.
+
+### Contact details (email, phone)
+
+`spond_get_profile`, `spond_list_groups`, `spond_get_group`, and
+`spond_find_person` accept `include_contact: true`. By default these
+return only names and IDs:
+
+- `include_contact=false` → email / phone are stripped from the response.
+- `include_contact=true` → returns email / phone *only if*
+  `SPOND_MCP_ALLOW_CONTACT_DETAILS=true`. Otherwise the tool returns a
+  `spond_policy_denied` error before contacting Spond.
+
+This separation is intentional: the agent might legitimately need a name
+for context but should not exfiltrate contact PII into a transcript or
+downstream tool unless the operator explicitly permits it.
 
 ### Side-effect gating in detail
 
@@ -185,14 +207,12 @@ without contacting Spond.
 - `"accepted"` → upstream payload `{"accepted": "true"}`
 - `"declined"` → upstream payload `{"accepted": "false"}`
 
-These two correspond to documented upstream behavior. The third value,
-`"unanswered"`, is **experimental**: the upstream library does not document
-or test the `{"accepted": "unanswered"}` payload, and it is rejected with a
-`spond_validation_error` unless
-`SPOND_MCP_ALLOW_EXPERIMENTAL_ATTENDANCE_PAYLOADS=true` is set. Read tools
-(event detail, attendance summary) continue to surface the *count* of
-unanswered members regardless of this flag — only the side-effecting
-**change** is gated.
+These two correspond to documented upstream behavior, so they are the only
+values the schema advertises. An `unanswered` change is **not** exposed by
+the side-effecting tool because the upstream library does not document or
+test a `{"accepted": "unanswered"}` payload. Read tools
+(`spond_get_event`, attendance summaries) continue to surface unanswered
+counts and member IDs.
 
 #### Send-message routing
 
@@ -215,29 +235,41 @@ of silently no-op'ing.
 
 - Credentials live in environment variables and never appear in logs or
   error messages.
-- Outgoing message bodies are not echoed in tool responses.
+- Outgoing message bodies are not echoed in tool responses, including when
+  the upstream library leaks an un-awaited continuation coroutine.
+- Errors from nested awaitable continuations are normalised through
+  `SpondClientManager.resolve_awaitable_result()`, which strips upstream
+  body text and never surfaces raw exception messages.
 - Message previews are truncated to 160 characters by default. Full bodies
   require `SPOND_MCP_ALLOW_RAW_PAYLOADS=true` *and* `include_raw: true`.
-- Member contact details, full chat history, and raw financial records
-  (`spond_list_club_transactions` raw payloads) are gated behind the same
-  raw-payload flag.
+- Member email / phone numbers are gated by `SPOND_MCP_ALLOW_CONTACT_DETAILS`
+  *and* an explicit `include_contact: true` argument.
+- Raw financial records (`spond_list_club_transactions` raw payloads) and
+  full chat history are gated behind `SPOND_MCP_ALLOW_RAW_PAYLOADS`.
 - Tool descriptions are factual; they contain no instructions to the agent.
   Prompt-injection vectors are limited to the upstream Spond data itself —
   treat that data as untrusted when forwarding it back to the model.
 - The server does **not** expose a generic raw-API tool. New endpoints must
   be added explicitly with their own schema.
-- The XLSX attendance export is never returned as inline content; it is
-  either summarized as metadata or written to a temp file path.
+- The XLSX attendance export defaults to metadata only. The
+  `mode="tempfile"` branch is gated by `SPOND_MCP_ALLOW_FILE_EXPORTS`, and
+  the on-disk filename is sanitised (no slashes, no `..`, ≤ 64-char stem,
+  always `.xlsx`).
 
 ## Development
 
+The same three commands run in CI (see `.github/workflows/ci.yml`):
+
 ```bash
+pip install -e ".[dev]"
 ruff check .
+python -m compileall -q src tests
 pytest
 ```
 
 The test suite uses fakes for `spond.spond.Spond` and `spond.club.SpondClub`,
-so no real account is needed.
+so no real account is needed. CI runs against Python 3.11 and 3.12 on every
+push and pull request.
 
 Project layout:
 
@@ -301,6 +333,20 @@ issue tracker — the wrapper sometimes needs to follow upstream changes.
 The defaults are read-only on purpose. Either keep using the read tools, or
 flip `SPOND_MCP_READ_ONLY` to `false` *and* the matching `ALLOW_*` flag, then
 pass `confirm: true` at call time.
+
+**`spond_policy_denied: Raw upstream payloads are disabled by policy.`**
+You passed `include_raw: true`. Set `SPOND_MCP_ALLOW_RAW_PAYLOADS=true` if
+that is intentional; otherwise drop the argument.
+
+**`spond_policy_denied: Contact details are disabled by policy.`**
+You passed `include_contact: true`. Set `SPOND_MCP_ALLOW_CONTACT_DETAILS=true`
+if you intend to expose member email/phone; otherwise drop the argument.
+
+**`spond_policy_denied: Writing attendance reports to disk is disabled by policy.`**
+You called `spond_get_event_attendance_report` with `mode="tempfile"`. Use
+`mode="metadata"` for a side-effect-free response, or set
+`SPOND_MCP_ALLOW_FILE_EXPORTS=true` if persisting Spond data on disk is
+acceptable for this deployment.
 
 ## License
 

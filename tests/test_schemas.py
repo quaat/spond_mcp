@@ -45,12 +45,19 @@ def test_map_profile_redacts_when_include_raw_false():
         "firstName": "A",
         "lastName": "B",
         "email": "a@b.com",
+        "phoneNumber": "+1-555-0100",
         "secret": "do-not-leak",
     }
-    summary = map_profile(profile, include_raw=False).model_dump(exclude_none=True)
+    # Default: contact stripped.
+    summary = map_profile(profile).model_dump(exclude_none=True)
     assert "raw" not in summary
     assert summary["full_name"] == "A B"
-    assert summary["email"] == "a@b.com"
+    assert "email" not in summary
+    assert "phone" not in summary
+    # Opt-in: contact present.
+    contact = map_profile(profile, include_contact=True).model_dump(exclude_none=True)
+    assert contact["email"] == "a@b.com"
+    assert contact["phone"] == "+1-555-0100"
 
 
 def test_map_event_summary_truncates_via_detail():

@@ -82,3 +82,82 @@ async def test_get_spond_requires_credentials():
     mgr = SpondClientManager(Settings(spond_username=None, spond_password=None))
     with pytest.raises(SpondAuthError):
         await mgr.get_spond()
+
+
+@pytest.mark.asyncio
+async def test_resolve_awaitable_passes_through_non_awaitable(settings_factory):
+    mgr = SpondClientManager(settings_factory())
+    assert await mgr.resolve_awaitable_result("op", {"id": "x"}) == {"id": "x"}
+    assert await mgr.resolve_awaitable_result("op", 42) == 42
+    assert await mgr.resolve_awaitable_result("op", None) is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_awaitable_drains_one_layer(settings_factory):
+    mgr = SpondClientManager(settings_factory())
+
+    async def _inner():
+        return {"id": "drained"}
+
+    out = await mgr.resolve_awaitable_result("op", _inner())
+    assert out == {"id": "drained"}
+
+
+@pytest.mark.asyncio
+async def test_resolve_awaitable_sanitises_value_error(settings_factory):
+    mgr = SpondClientManager(settings_factory())
+
+    async def _inner():
+        raise ValueError("Request failed with status 500: token=secret body=xyz")
+
+    with pytest.raises(SpondUpstreamError) as info:
+        await mgr.resolve_awaitable_result("op", _inner())
+    assert "secret" not in info.value.message
+    assert "xyz" not in info.value.message
+    assert "token=" not in info.value.message
+
+
+@pytest.mark.asyncio
+async def test_resolve_awaitable_wraps_generic_exception(settings_factory):
+    mgr = SpondClientManager(settings_factory())
+
+    class _BoomError(Exception):
+        def __str__(self) -> str:  # pragma: no cover - defensive
+            return "should-not-leak"
+
+    async def _inner():
+        raise _BoomError()
+
+    with pytest.raises(SpondUpstreamError) as info:
+        await mgr.resolve_awaitable_result("op", _inner())
+    assert "should-not-leak" not in info.value.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
+async def test_resolve_awaitable_caps_chain_length(settings_factory):
+    """The drain loop must refuse to unwind an unbounded awaitable chain."""
+
+    mgr = SpondClientManager(settings_factory())
+
+    class _ForeverAwaitable:
+        """Awaitable that, once awaited, returns another instance of itself.
+
+        This makes an unbounded chain without spawning real coroutines, so the
+        cap test does not depend on un-awaited coroutine cleanup behaviour.
+        """
+
+        def __await__(self):
+            # Returning a generator that yields nothing and produces a new
+            # awaitable as its final value lets `await` resolve to another
+            # awaitable instance.
+            def _gen():
+                if False:
+                    yield  # pragma: no cover
+                return _ForeverAwaitable()
+
+            return _gen()
+
+    with pytest.raises(SpondUpstreamError) as info:
+        await mgr.resolve_awaitable_result("op", _ForeverAwaitable())
+    assert "unbounded" in info.value.message.lower()
