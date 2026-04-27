@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "spond-mcp"
+version = "0.1.0"
+description = "A local-first Model Context Protocol server that wraps the unofficial Spond Python library."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "spond-mcp contributors" }]
+keywords = ["mcp", "spond", "claude", "model-context-protocol"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "mcp>=1.6.0",
+    "spond>=1.2.0",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "python-dotenv>=1.0",
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+spond-mcp = "spond_mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/Olen/Spond"
+Issues = "https://github.com/Olen/Spond/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/spond_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "README.md", ".env.example", "pyproject.toml"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W", "I", "B", "UP", "N", "C4", "RUF", "SIM",
+]
+ignore = [
+    "E501",  # handled by formatter
+    "B008",  # FastMCP relies on default-arg patterns
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011", "N802"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
