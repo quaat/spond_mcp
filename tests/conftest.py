@@ -48,7 +48,6 @@ class FakeSpond:
         messages: list[dict[str, Any]] | None = None,
         posts: list[dict[str, Any]] | None = None,
         xlsx: bytes = b"PK\x03\x04fake",
-        has_get_posts: bool = True,
     ) -> None:
         self.profile_data = profile or {
             "id": "p1",
@@ -117,8 +116,6 @@ class FakeSpond:
         self.change_response_payloads: list[dict[str, Any]] = []
         self.sent_messages: list[dict[str, Any]] = []
         self.send_message_result: Any = {"id": "msg1"}
-        if not has_get_posts:
-            del self.__class__.get_posts  # type: ignore[attr-defined]
 
     def _record(self, name: str, *args: Any, **kwargs: Any) -> None:
         self.calls.append((name, args, kwargs))
@@ -186,6 +183,18 @@ class FakeSpond:
     async def get_posts(self, **kwargs: Any) -> list[dict[str, Any]]:
         self._record("get_posts", **kwargs)
         return list(self.posts_data)
+
+
+class FakeSpondWithoutPosts:
+    """A standalone fake without ``get_posts`` for the unsupported-method test.
+
+    Defined as its own class instead of mutating ``FakeSpond`` so test order
+    cannot affect other tests. Mirrors the surface area `spond_list_posts`
+    actually touches, plus `clientsession` for cleanup.
+    """
+
+    def __init__(self) -> None:
+        self.clientsession = FakeSession()
 
 
 class FakeSpondClub:

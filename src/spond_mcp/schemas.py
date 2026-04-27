@@ -16,8 +16,22 @@ from pydantic import BaseModel, ConfigDict, Field
 # Constants
 # ---------------------------------------------------------------------------
 
-ResponseLiteral = Literal["accepted", "declined", "unanswered"]
-"""Allowed values for attendance changes."""
+ResponseLiteral = Literal["accepted", "declined"]
+"""Allowed values for the `spond_change_event_response` tool.
+
+Only "accepted" and "declined" are accepted by default because those are the
+only payload shapes that have been verified against the upstream library
+(`{"accepted": "true"}` / `{"accepted": "false"}`). The "unanswered" payload is
+not documented upstream; clients can opt in to it via
+`SPOND_MCP_ALLOW_EXPERIMENTAL_ATTENDANCE_PAYLOADS=true`.
+
+Note: "unanswered" is still surfaced in *read-side* counts/IDs because it is
+a documented attribute of the upstream `responses` object.
+"""
+
+ExperimentalResponseLiteral = Literal["accepted", "declined", "unanswered"]
+"""Same as :data:`ResponseLiteral` but includes the experimental "unanswered"
+payload. Only used when the operator has opted in."""
 
 JSONDict = dict[str, Any]
 

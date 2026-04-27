@@ -8,13 +8,18 @@ version = "0.1.0"
 description = "A local-first Model Context Protocol server that wraps the unofficial Spond Python library."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+# This project depends on `spond` (https://github.com/Olen/Spond), which is
+# distributed under GPL-3.0. To remain compatible when this project is
+# distributed together with `spond`, this project is licensed under GPL-3.0
+# as well. Downstream users should review their own license obligations
+# before redistribution. See the LICENSE note in README.md.
+license = { text = "GPL-3.0-or-later" }
 authors = [{ name = "spond-mcp contributors" }]
 keywords = ["mcp", "spond", "claude", "model-context-protocol"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",

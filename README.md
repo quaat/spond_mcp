@@ -20,11 +20,17 @@ autonomous agents (Claude Desktop, Claude Code, MCP Inspector, etc.).
   message drafting.
 - Read-only by default. All side effects are gated behind two layers: an
   environment policy flag *and* an explicit `confirm: true` argument.
-- Compact, agent-friendly summaries with optional `include_raw` for diagnostics.
+- Compact, agent-friendly summaries by default. Raw upstream payloads
+  (`include_raw=true`) require an explicit `SPOND_MCP_ALLOW_RAW_PAYLOADS=true`
+  opt-in because they contain PII, full message bodies, and raw financial
+  records.
+- Attendance changes accept only verified payloads (`accepted`, `declined`).
+  The unverified `unanswered` payload is opt-in via
+  `SPOND_MCP_ALLOW_EXPERIMENTAL_ATTENDANCE_PAYLOADS=true`.
 - Lazy `aiohttp` session management with clean shutdown.
 - Short-TTL cache for low-risk reads, with `refresh: true` to bypass.
 - Pydantic-validated inputs and structured error envelopes.
-- 48 unit tests with fully fake Spond clients — no real credentials needed
+- 70 unit tests with fully fake Spond clients — no real credentials needed
   to run CI.
 
 ## Installation
@@ -56,6 +62,8 @@ cp .env.example .env
 | `SPOND_MCP_READ_ONLY` | `true` | Master switch. While `true`, every side-effecting tool is refused. |
 | `SPOND_MCP_ALLOW_MESSAGES` | `false` | Allow `spond_send_message`. Has no effect unless `SPOND_MCP_READ_ONLY=false`. |
 | `SPOND_MCP_ALLOW_ATTENDANCE_CHANGES` | `false` | Allow `spond_change_event_response`. Has no effect unless `SPOND_MCP_READ_ONLY=false`. |
+| `SPOND_MCP_ALLOW_RAW_PAYLOADS` | `false` | Permit `include_raw=true` on read tools. Off by default to keep PII / financials / message bodies out of agent context. |
+| `SPOND_MCP_ALLOW_EXPERIMENTAL_ATTENDANCE_PAYLOADS` | `false` | Permit `response="unanswered"` on `spond_change_event_response`. The payload `{"accepted": "unanswered"}` is not documented upstream and may not behave as expected. |
 | `SPOND_MCP_MAX_EVENTS` | `100` | Hard cap applied to `spond_list_events.max_events`. |
 | `SPOND_MCP_TIMEZONE` | `UTC` | Reserved for future schedule formatting. Internally everything stays in UTC. |
 | `SPOND_MCP_CACHE_TTL_SECONDS` | `60` | TTL for cached profile/groups/events/posts reads. Set to `0` to disable. |
@@ -144,15 +152,18 @@ in clients that surface MCP prompts.
 | `spond_get_event` | Single event with attendance summary. | No |
 | `spond_summarize_schedule` | Day-grouped schedule between two ISO datetimes. | No |
 | `spond_get_event_attendance_report` | XLSX export, returned as metadata or written to a temp file. | No |
-| `spond_change_event_response` | Set a member's response to *accepted* / *declined* / *unanswered*. | **Yes** |
+| `spond_change_event_response` | Set a member's response to *accepted* or *declined* (and *unanswered* under an experimental flag). | **Yes** |
 | `spond_list_messages` | Recent chats with truncated previews. | No |
 | `spond_send_message` | Send a Spond chat message. | **Yes** |
 | `spond_list_posts` | Group wall posts (graceful error if the installed library lacks `get_posts`). | No |
 | `spond_list_club_transactions` | Spond Club finance transactions. | No |
 
-All tools accept `include_raw: true` (read-only tools only) for diagnostic
-access to the raw upstream payload, and read tools accept `refresh: true` to
-bypass the cache.
+All read tools accept `refresh: true` to bypass the in-memory cache. They
+also accept `include_raw: true` for diagnostic access to the raw upstream
+payload, **but `include_raw` is rejected by default**: returning the raw
+payload requires `SPOND_MCP_ALLOW_RAW_PAYLOADS=true`. Without that opt-in,
+all reads return compact summaries only — never raw PII, full message
+bodies, or raw financial records.
 
 ### Side-effect gating in detail
 
@@ -167,13 +178,49 @@ Side-effecting tools require **both**:
 If either layer is missing, the tool returns a `spond_policy_denied` error
 without contacting Spond.
 
+#### Attendance change values
+
+`spond_change_event_response` accepts:
+
+- `"accepted"` → upstream payload `{"accepted": "true"}`
+- `"declined"` → upstream payload `{"accepted": "false"}`
+
+These two correspond to documented upstream behavior. The third value,
+`"unanswered"`, is **experimental**: the upstream library does not document
+or test the `{"accepted": "unanswered"}` payload, and it is rejected with a
+`spond_validation_error` unless
+`SPOND_MCP_ALLOW_EXPERIMENTAL_ATTENDANCE_PAYLOADS=true` is set. Read tools
+(event detail, attendance summary) continue to surface the *count* of
+unanswered members regardless of this flag — only the side-effecting
+**change** is gated.
+
+#### Send-message routing
+
+`spond_send_message` enforces exactly one routing mode per call:
+
+- continue an existing chat: pass `chat_id` only
+- start a new chat: pass both `user` and `group_id`
+
+Any other combination (mixing `chat_id` with `user`/`group_id`, or
+specifying only one of `user` / `group_id` without `chat_id`) is rejected
+with a `spond_validation_error` before any network call.
+
+The upstream library has a known bug where
+`send_message(chat_id=...)` returns the un-awaited coroutine produced by its
+internal `_continue_chat` call. The MCP server detects an awaitable return
+value and awaits it exactly once, so chat-id sends actually deliver instead
+of silently no-op'ing.
+
 ## Security notes
 
 - Credentials live in environment variables and never appear in logs or
   error messages.
 - Outgoing message bodies are not echoed in tool responses.
-- Message previews are truncated to 160 characters by default. Pass
-  `include_raw: true` to see full bodies.
+- Message previews are truncated to 160 characters by default. Full bodies
+  require `SPOND_MCP_ALLOW_RAW_PAYLOADS=true` *and* `include_raw: true`.
+- Member contact details, full chat history, and raw financial records
+  (`spond_list_club_transactions` raw payloads) are gated behind the same
+  raw-payload flag.
 - Tool descriptions are factual; they contain no instructions to the agent.
   Prompt-injection vectors are limited to the upstream Spond data itself —
   treat that data as untrusted when forwarding it back to the model.
@@ -211,6 +258,27 @@ tests/
   test_server_tools.py
 ```
 
+## Tool behavior notes
+
+### Date/time filtering on `spond_list_events` and `spond_summarize_schedule`
+
+`from_datetime` / `to_datetime` accept any ISO-8601 string. Naive timestamps
+are interpreted as UTC, offsets are normalized to UTC.
+
+⚠️ **Time-of-day filtering may be approximate.** The upstream `spond` library
+formats `datetime` filters using
+`strftime("%Y-%m-%dT00:00:00.000Z")` regardless of the time you pass, so
+the upstream API receives a date-at-midnight value. The hours/minutes/seconds
+component of `from_datetime`/`to_datetime` is therefore effectively ignored
+by the upstream filter — events on the boundary day may either be included
+or excluded depending on which midnight upstream chose. This MCP server
+preserves your full-precision input when it can (caching, `summarize_schedule`
+day grouping), but cannot work around the upstream library's date-only
+boundary serialization on the network call itself.
+
+If you need precise sub-day filtering, pull a wider range and post-filter
+on the returned `start`/`end` timestamps in the agent's response.
+
 ## Troubleshooting
 
 **`spond_auth_error: Spond credentials are not configured.`**
@@ -236,5 +304,19 @@ pass `confirm: true` at call time.
 
 ## License
 
-MIT. The `spond` library it wraps is also MIT-licensed but maintained
-independently; please do not file Spond-API issues against this repo.
+This MCP server is distributed under **GPL-3.0-or-later**.
+
+It depends on, and is intended to be distributed alongside, the
+[`Olen/Spond`](https://github.com/Olen/Spond) Python library, which is
+licensed under **GPL-3.0**. Because this project links against and
+redistributes (as a dependency) GPL-3.0 code, GPL-3.0-or-later is the
+minimum compatible license here.
+
+If you redistribute this server (e.g. bundling it into another product,
+shipping as a Docker image, or republishing as a package) you take on the
+upstream GPL-3.0 obligations: source availability, copyleft on derivative
+works, and license-notice preservation. Review your own legal obligations
+before redistribution; this README is informational and not legal advice.
+
+The Spond service itself is operated by Spond AS and is not affiliated with
+this project. Please do not file Spond-API issues against this repository.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ from .schemas import (
     ChatSummary,
     EventDetail,
     EventSummary,
+    ExperimentalResponseLiteral,
     GroupSummary,
     JSONDict,
     MemberSummary,
@@ -68,6 +70,25 @@ def _to_dict(obj: Any) -> JSONResult:
 
 def _error(exc: SpondMcpError) -> JSONResult:
     return ToolError(code=exc.code, message=exc.message, details=exc.details).model_dump()
+
+
+def _check_raw_allowed(settings: Settings, requested: bool) -> None:
+    """Reject ``include_raw=true`` unless the operator has opted in.
+
+    Raw upstream payloads contain PII (member contact details), full message
+    bodies, and raw financial records. They must never be returned by default.
+    """
+
+    if requested and not settings.raw_payloads_allowed():
+        raise SpondPolicyError(
+            "Raw upstream payloads are disabled by policy.",
+            details={
+                "hint": (
+                    "Set SPOND_MCP_ALLOW_RAW_PAYLOADS=true to permit include_raw "
+                    "responses. Compact summaries are returned without it."
+                ),
+            },
+        )
 
 
 def _wrap_tool(fn):
@@ -119,6 +140,8 @@ def build_server(
         include_raw: Annotated[bool, Field(description="Include the raw upstream payload")] = False,
         refresh: Annotated[bool, Field(description="Bypass the in-memory cache")] = False,
     ) -> JSONResult:
+        _check_raw_allowed(settings, include_raw)
+
         async def _fetch() -> JSONDict:
             client = await manager.get_spond()
             return await manager.call("get_profile", client.get_profile)
@@ -136,6 +159,8 @@ def build_server(
         include_raw: bool = False,
         refresh: bool = False,
     ) -> JSONResult:
+        _check_raw_allowed(settings, include_raw)
+
         async def _fetch() -> list[JSONDict]:
             client = await manager.get_spond()
             return await manager.call("get_groups", client.get_groups) or []
@@ -164,6 +189,7 @@ def build_server(
     ) -> JSONResult:
         if not group_id:
             raise SpondValidationError("group_id is required")
+        _check_raw_allowed(settings, include_raw)
 
         async def _fetch() -> JSONDict:
             client = await manager.get_spond()
@@ -187,6 +213,7 @@ def build_server(
     ) -> JSONResult:
         if not query or not query.strip():
             raise SpondValidationError("query must not be empty")
+        _check_raw_allowed(settings, include_raw)
 
         client = await manager.get_spond()
         if group_id:
@@ -224,6 +251,7 @@ def build_server(
         include_raw: bool = False,
         refresh: bool = False,
     ) -> JSONResult:
+        _check_raw_allowed(settings, include_raw)
         try:
             min_start = parse_iso_datetime(from_datetime)
             max_start = parse_iso_datetime(to_datetime)
@@ -286,6 +314,7 @@ def build_server(
     ) -> JSONResult:
         if not event_id:
             raise SpondValidationError("event_id is required")
+        _check_raw_allowed(settings, include_raw)
 
         async def _fetch() -> JSONDict:
             client = await manager.get_spond()
@@ -380,15 +409,21 @@ def build_server(
     @mcp.tool(
         name="spond_change_event_response",
         description=(
-            "Change a user's response/attendance for an event. Requires "
-            "SPOND_MCP_ALLOW_ATTENDANCE_CHANGES=true and confirm=true."
+            "Change a user's response/attendance for an event. Accepts "
+            "response='accepted' or 'declined'. Requires "
+            "SPOND_MCP_ALLOW_ATTENDANCE_CHANGES=true and confirm=true. "
+            "The 'unanswered' value is experimental and only accepted when "
+            "SPOND_MCP_ALLOW_EXPERIMENTAL_ATTENDANCE_PAYLOADS=true."
         ),
     )
     @_wrap_tool
     async def spond_change_event_response(
         event_id: str,
         user_id: str,
-        response: ResponseLiteral,
+        # Typed as the experimental literal so the JSON schema lists every
+        # value the tool can accept; the runtime gate below rejects the
+        # experimental value unless the operator opted in.
+        response: ExperimentalResponseLiteral,
         confirm: bool = False,
     ) -> JSONResult:
         if not settings.attendance_changes_allowed():
@@ -403,6 +438,11 @@ def build_server(
             raise SpondPolicyError("Refusing to change attendance without confirm=true.")
         if not event_id or not user_id:
             raise SpondValidationError("event_id and user_id are required")
+        if response == "unanswered" and not settings.experimental_attendance_allowed():
+            raise SpondValidationError(
+                "response='unanswered' is experimental and disabled by policy. "
+                "Set SPOND_MCP_ALLOW_EXPERIMENTAL_ATTENDANCE_PAYLOADS=true to enable.",
+            )
 
         payload = _response_payload(response)
         client = await manager.get_spond()
@@ -421,8 +461,9 @@ def build_server(
     @mcp.tool(
         name="spond_list_messages",
         description=(
-            "List recent chats. Message bodies are truncated to a preview unless "
-            "include_raw=true."
+            "List recent chats. Message bodies are truncated to a short preview. "
+            "Returning the full upstream payload requires "
+            "SPOND_MCP_ALLOW_RAW_PAYLOADS=true."
         ),
     )
     @_wrap_tool
@@ -432,6 +473,7 @@ def build_server(
     ) -> JSONResult:
         if max_chats <= 0:
             raise SpondValidationError("max_chats must be positive")
+        _check_raw_allowed(settings, include_raw)
         client = await manager.get_spond()
         chats = (
             await manager.call("get_messages", lambda: client.get_messages(max_chats=max_chats))
@@ -445,8 +487,9 @@ def build_server(
     @mcp.tool(
         name="spond_send_message",
         description=(
-            "Send a Spond chat message to an existing chat or to a user in a group. "
-            "Requires SPOND_MCP_ALLOW_MESSAGES=true and confirm=true."
+            "Send a Spond chat message. Routing is exclusive: either continue an "
+            "existing chat by chat_id, or start a new chat by providing both user "
+            "and group_id. Requires SPOND_MCP_ALLOW_MESSAGES=true and confirm=true."
         ),
     )
     @_wrap_tool
@@ -471,9 +514,16 @@ def build_server(
             raise SpondValidationError("text must not be empty")
         if len(text) > 4000:
             raise SpondValidationError("text exceeds the 4000-character limit")
-        if not chat_id and not (user and group_id):
+
+        # Exactly one routing mode: existing chat OR new chat.
+        if chat_id is not None and (user is not None or group_id is not None):
             raise SpondValidationError(
-                "Provide either chat_id or both user and group_id."
+                "Ambiguous routing: provide either chat_id (existing chat) or "
+                "both user and group_id (new chat), but not both.",
+            )
+        if chat_id is None and (user is None or group_id is None):
+            raise SpondValidationError(
+                "Provide either chat_id or both user and group_id.",
             )
 
         client = await manager.get_spond()
@@ -483,8 +533,15 @@ def build_server(
                 text=text, user=user, group_uid=group_id, chat_id=chat_id
             ),
         )
-        # The upstream send_message has an inconsistent return shape; treat any
-        # dict with an "error" key as a failure but never echo the body back.
+        # The upstream `send_message` has a known bug: in the chat_id path it
+        # returns the un-awaited coroutine produced by `_continue_chat`. Detect
+        # that and await it exactly once before reporting success, otherwise
+        # the message is never actually sent.
+        if inspect.isawaitable(result):
+            result = await result
+
+        # Treat any dict with an "error" key as a failure but never echo the
+        # body back to the caller.
         sent_id = None
         ok = True
         if isinstance(result, dict):
@@ -511,6 +568,7 @@ def build_server(
         include_raw: bool = False,
         refresh: bool = False,
     ) -> JSONResult:
+        _check_raw_allowed(settings, include_raw)
         client = await manager.get_spond()
         if not hasattr(client, "get_posts"):
             raise SpondUnsupportedError(
@@ -553,6 +611,7 @@ def build_server(
             )
         if max_items <= 0:
             raise SpondValidationError("max_items must be positive")
+        _check_raw_allowed(settings, include_raw)
 
         club = await manager.get_club()
         txs = (
@@ -716,8 +775,13 @@ def _person_result(person: JSONDict, *, include_raw: bool = False, is_guardian: 
     )
 
 
-def _response_payload(response: ResponseLiteral) -> JSONDict:
-    """Translate the curated enum into the upstream payload."""
+def _response_payload(response: ExperimentalResponseLiteral) -> JSONDict:
+    """Translate the curated enum into the upstream payload.
+
+    Only "accepted" and "declined" map to documented upstream payloads.
+    "unanswered" is experimental and the caller is expected to have already
+    gated it on :meth:`Settings.experimental_attendance_allowed`.
+    """
 
     if response == "accepted":
         return {"accepted": "true"}

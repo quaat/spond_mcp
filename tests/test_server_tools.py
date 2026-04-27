@@ -29,7 +29,9 @@ async def test_get_profile_returns_summary(manager):
 
 @pytest.mark.asyncio
 async def test_get_profile_with_raw_includes_raw(manager):
-    mcp, _ = build_server(manager.settings, manager=manager)
+    s = manager.settings.model_copy(update={"spond_mcp_allow_raw_payloads": True})
+    manager.settings = s
+    mcp, _ = build_server(s, manager=manager)
     result = await _call(mcp, "spond_get_profile", {"include_raw": True})
     assert result["raw"]["id"] == "p1"
 
@@ -170,7 +172,9 @@ async def test_list_messages_truncates_text(manager):
 
 @pytest.mark.asyncio
 async def test_list_messages_with_raw(manager):
-    mcp, _ = build_server(manager.settings, manager=manager)
+    s = manager.settings.model_copy(update={"spond_mcp_allow_raw_payloads": True})
+    manager.settings = s
+    mcp, _ = build_server(s, manager=manager)
     result = await _call(
         mcp, "spond_list_messages", {"max_chats": 10, "include_raw": True}
     )
@@ -289,7 +293,6 @@ async def test_change_response_translates_enum(manager):
     for label, expected in (
         ("accepted", {"accepted": "true"}),
         ("declined", {"accepted": "false"}),
-        ("unanswered", {"accepted": "unanswered"}),
     ):
         result = await _call(
             mcp,
@@ -298,6 +301,45 @@ async def test_change_response_translates_enum(manager):
         )
         assert "error" not in result or result.get("error") is None or result.get("error") is False
         assert manager.fake.change_response_payloads[-1] == expected
+
+
+@pytest.mark.asyncio
+async def test_change_response_unanswered_blocked_by_default(manager):
+    """The 'unanswered' value must not produce an unverified upstream payload."""
+
+    s = manager.settings.model_copy(
+        update={"spond_mcp_read_only": False, "spond_mcp_allow_attendance_changes": True}
+    )
+    manager.settings = s
+    mcp, _ = build_server(s, manager=manager)
+    result = await _call(
+        mcp,
+        "spond_change_event_response",
+        {"event_id": "e1", "user_id": "m1", "response": "unanswered", "confirm": True},
+    )
+    assert result["error"] is True
+    assert result["code"] == "spond_validation_error"
+    assert manager.fake.change_response_payloads == []
+
+
+@pytest.mark.asyncio
+async def test_change_response_unanswered_allowed_with_experimental_flag(manager):
+    s = manager.settings.model_copy(
+        update={
+            "spond_mcp_read_only": False,
+            "spond_mcp_allow_attendance_changes": True,
+            "spond_mcp_allow_experimental_attendance_payloads": True,
+        }
+    )
+    manager.settings = s
+    mcp, _ = build_server(s, manager=manager)
+    result = await _call(
+        mcp,
+        "spond_change_event_response",
+        {"event_id": "e1", "user_id": "m1", "response": "unanswered", "confirm": True},
+    )
+    assert "error" not in result or result.get("error") is None or result.get("error") is False
+    assert manager.fake.change_response_payloads[-1] == {"accepted": "unanswered"}
 
 
 # ---------------------------------------------------------------------------
@@ -316,11 +358,11 @@ async def test_list_posts_returns_summaries(manager):
 @pytest.mark.asyncio
 async def test_list_posts_unsupported_when_method_missing(monkeypatch):
     from spond_mcp.client import SpondClientManager
-    from tests.conftest import FakeSpond, make_settings
+    from tests.conftest import FakeSpondWithoutPosts, make_settings
 
     settings = make_settings()
     mgr = SpondClientManager(settings)
-    fake = FakeSpond(has_get_posts=False)
+    fake = FakeSpondWithoutPosts()
 
     async def _get_spond():
         return fake

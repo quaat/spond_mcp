@@ -27,6 +27,16 @@ class Settings(BaseSettings):
     spond_mcp_allow_messages: bool = Field(default=False)
     spond_mcp_allow_attendance_changes: bool = Field(default=False)
 
+    # Disclosure policy: even read-only callers cannot dump raw upstream
+    # payloads (which contain PII, contact details, full message bodies, and
+    # raw financial records) unless this is explicitly enabled by the operator.
+    spond_mcp_allow_raw_payloads: bool = Field(default=False)
+
+    # Experimental upstream payloads (e.g. unverified attendance "unanswered"
+    # payload). Off by default so the server never sends a payload it has not
+    # verified against the upstream library or live API.
+    spond_mcp_allow_experimental_attendance_payloads: bool = Field(default=False)
+
     spond_mcp_max_events: int = Field(default=100, ge=1, le=1000)
     spond_mcp_timezone: str = Field(default="UTC")
     spond_mcp_cache_ttl_seconds: int = Field(default=60, ge=0, le=3600)
@@ -53,6 +63,12 @@ class Settings(BaseSettings):
 
     def attendance_changes_allowed(self) -> bool:
         return not self.spond_mcp_read_only and self.spond_mcp_allow_attendance_changes
+
+    def raw_payloads_allowed(self) -> bool:
+        return self.spond_mcp_allow_raw_payloads
+
+    def experimental_attendance_allowed(self) -> bool:
+        return self.spond_mcp_allow_experimental_attendance_payloads
 
 
 @lru_cache(maxsize=1)
