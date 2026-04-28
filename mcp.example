@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "spond-mcp": {
+	"command": "[PATH-TO]/spond_mcp/.venv/bin/spond-mcp",
+	"env": {
+            "SPOND_MCP_READ_ONLY": "true"
+	}
+    }
+  }
+}
